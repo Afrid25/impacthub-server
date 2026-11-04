@@ -26,13 +26,20 @@ export async function connectToMongoDB() {
   }
 }
 
-connectToMongoDB();
+const mongnoClient = await connectToMongoDB();
+const db = mongnoClient.db("impacthub");
+const eventsCollection = db.collection("events");
 
 app.post("/add-events",  (req, res) => {
   const data = req.body;
+  const result = eventsCollection.insertOne(data);
+  console.log(result);
+  res.send(result);
+});
 
-  console.log(data);
-  res.send({message : "Event added successfully"});
+app.get("/all-events", async (req, res) => {
+  const result = await eventsCollection.find({}).toArray();
+  res.send(result);
 });
 
 
