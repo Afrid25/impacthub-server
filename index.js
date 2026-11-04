@@ -1,5 +1,5 @@
 import express from "express";
-import { MongoClient } from 'mongodb';
+import { MongoClient, ObjectId } from 'mongodb';
 import dotenv from "dotenv";
 import cors from "cors";
 
@@ -42,6 +42,11 @@ app.get("/all-events", async (req, res) => {
   res.send(result);
 });
 
+app.get("/all-events/:id", async (req, res) => {
+  const { id } = req.params;
+  const result = await eventsCollection.findOne({ _id: new ObjectId(id) });
+  res.send(result);
+});
 
 app.get("/", (req, res) => {
   res.send("Hello World");
