@@ -10,7 +10,7 @@ app.use(cors());
 app.use(express.json());
 const PORT = 4500;
 
-//http://localhost:4500/
+//http://localhost:4500/joined
 
 
 
@@ -38,6 +38,12 @@ app.post("/add-events",  (req, res) => {
   res.send(result);
 });
 
+app.get("/joined-events/:email", async (req, res) => {
+  const {email} = req.params;
+  const result = await joiningCollection.find({ userEmail: email }).toArray();
+  res.send(result);
+});
+
 app.get("/all-events", async (req, res) => {
   const result = await eventsCollection.find({}).toArray();
   res.send(result);
@@ -49,11 +55,21 @@ app.post("/joined", async (req, res) => {
   res.send(result);
 });
 
+
+app.delete("/delete-events/:id", async (req, res) => {
+  const {id} = req.params;
+  const result = await joiningCollection.deleteOne({ _id: new ObjectId(id) });
+  res.send(result);
+});
+
+
+
 app.get("/all-events/:id", async (req, res) => {
   const { id } = req.params;
   const result = await eventsCollection.findOne({ _id: new ObjectId(id) });
   res.send(result);
 });
+
 
 app.get("/", (req, res) => {
   res.send("Hello World");
