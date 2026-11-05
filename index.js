@@ -56,17 +56,92 @@ app.post("/joined", async (req, res) => {
 });
 
 
-app.delete("/delete-events/:id", async (req, res) => {
-  const {id} = req.params;
-  const result = await joiningCollection.deleteOne({ _id: new ObjectId(id) });
-  res.send(result);
+// Leave a joined event
+app.delete("/delete-events/:id", verifyAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        message: "Invalid joined event ID",
+      });
+    }
+
+    const result = await joiningCollection.deleteOne({
+      _id: new ObjectId(id),
+      userId: req.user.id,
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({
+        message: "Joined event not found",
+      });
+    }
+
+    res.json({
+      success: true,
+      deletedCount: result.deletedCount,
+    });
+  } catch (error) {
+    res.status(500).json({
+      message: "Failed to leave event",
+    });
+  }
 });
 
-app.patch("/update-events/:id", async (req, res) => {
-  const { id } = req.params;
-  const updatedData = req.body;
-  const result = await joiningCollection.updateOne({ _id: new ObjectId(id) }, { $set: updatedData });
-  res.send(result);
+// Update my created event
+app.patch("/update-events/:id", verifyAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        message: "Invalid event ID",
+      });
+    }
+
+    const allowedFields = [
+      "title", "eventType", "date",
+      "location", "thumbnail", "description",
+    ];
+
+    const updates = {};
+
+    for (const field of allowedFields) {
+      if (req.body?.[field] !== undefined) {
+        updates[field] = req.body[field];
+      }
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({
+        message: "No valid fields to update",
+      });
+    }
+
+    const result = await eventsCollection.updateOne(
+      {
+        _id: new ObjectId(id),
+        userId: req.user.id,
+      },
+      { $set: updates }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({
+        message: "Event not found or access denied",
+      });
+    }
+
+    res.json({
+      success: true,
+      modifiedCount: result.modifiedCount,
+    });
+  } catch (error) {
+    res.status(500).json({
+      message: "Failed to update event",
+    });
+  }
 });
 
 
