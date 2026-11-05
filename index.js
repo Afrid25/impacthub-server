@@ -29,6 +29,7 @@ export async function connectToMongoDB() {
 const mongnoClient = await connectToMongoDB();
 const db = mongnoClient.db("impacthub");
 const eventsCollection = db.collection("events");
+const joiningCollection = db.collection("joinedEvents");
 
 app.post("/add-events",  (req, res) => {
   const data = req.body;
@@ -39,6 +40,12 @@ app.post("/add-events",  (req, res) => {
 
 app.get("/all-events", async (req, res) => {
   const result = await eventsCollection.find({}).toArray();
+  res.send(result);
+});
+
+app.post("/joined", async (req, res) => {
+  const data = req.body;
+  const result = await joiningCollection.insertOne(data);
   res.send(result);
 });
 
