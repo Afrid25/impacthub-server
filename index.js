@@ -62,6 +62,12 @@ app.delete("/delete-events/:id", async (req, res) => {
   res.send(result);
 });
 
+app.patch("/update-events/:id", async (req, res) => {
+  const { id } = req.params;
+  const updatedData = req.body;
+  const result = await joiningCollection.updateOne({ _id: new ObjectId(id) }, { $set: updatedData });
+  res.send(result);
+});
 
 
 app.get("/all-events/:id", async (req, res) => {
