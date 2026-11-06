@@ -2,6 +2,7 @@ import express from "express";
 import { MongoClient, ObjectId } from 'mongodb';
 import dotenv from "dotenv";
 import cors from "cors";
+import { createRemoteJWKSet, jwtVerify } from "jose";
 
 dotenv.config();
 
@@ -45,6 +46,51 @@ async function verifyAuth(req, res, next) {
   }
 }
 
+// JWT authentication (Better Auth JWT plugin).
+// Verifies Bearer tokens against the Better Auth JWKS endpoint and attaches the
+// verified identity (from the `sub` claim) to req.user. Identity is never taken
+// from the client.
+const BASE_URL = process.env.BETTER_AUTH_URL || "http://localhost:3000";
+const JWKS_URL = `${BASE_URL.replace(/\/$/, "")}/api/auth/jwks`;
+const jwks = createRemoteJWKSet(new URL(JWKS_URL));
+
+async function verifyJwt(req, res, next) {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return res.status(401).json({ message: "Unauthorized: missing token" });
+  }
+
+  const token = authHeader.slice(7); // strip "Bearer "
+
+  try {
+    const { payload } = await jwtVerify(token, jwks, {
+      issuer: BASE_URL.replace(/\/$/, ""),
+      audience: BASE_URL.replace(/\/$/, ""),
+      clockTolerance: 30, // allow 30s clock skew
+    });
+
+    // Identity always comes from the verified JWT `sub` claim.
+    req.user = {
+      id: payload.sub,
+      email: payload.email,
+      name: payload.name,
+      image: payload.image,
+    };
+
+    next();
+  } catch (error) {
+    // Never log the token or any secrets.
+    if (error.name === "TokenExpiredError" || error.code === "ERR_JWT_EXPIRED") {
+      return res.status(401).json({ message: "Unauthorized: token expired" });
+    }
+    if (error.name === "JWTInvalid" || error.code === "ERR_JWS_INVALID") {
+      return res.status(401).json({ message: "Unauthorized: invalid token" });
+    }
+    return res.status(401).json({ message: "Unauthorized: authentication failed" });
+  }
+}
+
 // Records owned by the verified user. The email fallback applies ONLY to legacy
 // records whose userId is missing, null, or "" (emails are unique in Better Auth).
 // Records that carry a userId are matched strictly by that userId.
@@ -71,6 +117,8 @@ const isValidDateString = (value) => {
   return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
 };
 
+const getTodayString = () => new Date().toISOString().slice(0, 10);
+
 const isHttpUrl = (value) => {
   try {
     const { protocol } = new URL(value);
@@ -81,19 +129,27 @@ const isHttpUrl = (value) => {
 };
 
 // Returns { updates } on success or { error } with a client-safe message.
-function validateEventUpdates(body) {
+function validateEventUpdates(body, { requireAll = false } = {}) {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     return { error: "Request body must be a JSON object" };
   }
 
-  const unknown = Object.keys(body).filter((key) => !(key in EVENT_UPDATE_RULES));
-  if (unknown.length > 0) {
-    return { error: `Fields not allowed: ${unknown.join(", ")}` };
+  if (!requireAll) {
+    const unknown = Object.keys(body).filter((key) => !(key in EVENT_UPDATE_RULES));
+    if (unknown.length > 0) {
+      return { error: `Fields not allowed: ${unknown.join(", ")}` };
+    }
   }
 
+  const today = getTodayString();
   const updates = {};
   for (const [field, rule] of Object.entries(EVENT_UPDATE_RULES)) {
-    if (body[field] === undefined) continue;
+    if (body[field] === undefined) {
+      if (requireAll && rule.required) {
+        return { error: `${field} is required` };
+      }
+      continue;
+    }
 
     if (typeof body[field] !== "string") {
       return { error: `${field} must be a string` };
@@ -104,8 +160,13 @@ function validateEventUpdates(body) {
     if (rule.max && value.length > rule.max) {
       return { error: `${field} must be at most ${rule.max} characters` };
     }
-    if (rule.date && !isValidDateString(value)) {
-      return { error: "date must be a valid date in YYYY-MM-DD format" };
+    if (rule.date) {
+      if (!isValidDateString(value)) {
+        return { error: "date must be a valid date in YYYY-MM-DD format" };
+      }
+      if (value < today) {
+        return { error: "Event date cannot be in the past" };
+      }
     }
     if (rule.url && value && !isHttpUrl(value)) {
       return { error: "thumbnail must be a valid http(s) URL" };
@@ -141,10 +202,7 @@ const db = mongnoClient.db("impacthub");
 const eventsCollection = db.collection("events");
 const joiningCollection = db.collection("joinedEvents");
 
-// Prevent concurrent duplicate joins at the database level. Partial index:
-// only records with a non-empty string userId are covered, so existing legacy
-// records (no userId, including one known duplicate pair) are left untouched.
-// createIndex is idempotent; a failure is logged but does not stop the server.
+
 try {
   await joiningCollection.createIndex(
     { eventId: 1, userId: 1 },
@@ -160,10 +218,22 @@ try {
 
 app.post("/add-events", verifyAuth, async (req, res) => {
   try {
-    const { _id, ...data } = req.body || {};
+    const { updates: eventFields, error: validationError } = validateEventUpdates(
+      req.body,
+      { requireAll: true }
+    );
+    if (validationError) {
+      return res.status(400).json({ message: validationError });
+    }
+
     // Creator identity always comes from the verified session.
     const result = await eventsCollection.insertOne({
-      ...data,
+      title: eventFields.title,
+      eventType: eventFields.eventType,
+      date: eventFields.date,
+      location: eventFields.location ?? "",
+      thumbnail: eventFields.thumbnail ?? "",
+      description: eventFields.description ?? "",
       userId: req.user.id,
       userEmail: req.user.email,
       userName: req.user.name || "",
@@ -178,7 +248,10 @@ app.post("/add-events", verifyAuth, async (req, res) => {
 // Events created by the authenticated user (Manage Events)
 app.get("/my-events", verifyAuth, async (req, res) => {
   try {
-    const result = await eventsCollection.find(ownerFilter(req.user)).toArray();
+    const result = await eventsCollection
+      .find(ownerFilter(req.user))
+      .sort({ date: 1 })
+      .toArray();
     res.send(result);
   } catch (error) {
     console.error(error);
@@ -187,22 +260,46 @@ app.get("/my-events", verifyAuth, async (req, res) => {
 });
 
 app.get("/joined-events/:email", verifyAuth, async (req, res) => {
-  const {email} = req.params;
+  const { email } = req.params;
   if (email !== req.user.email) {
     return res.status(403).json({ message: "Access denied" });
   }
-  const result = await joiningCollection.find(ownerFilter(req.user)).toArray();
+  // Sort joined records by the original event date ascending.
+  const result = await joiningCollection
+    .find(ownerFilter(req.user))
+    .sort({ date: 1 })
+    .toArray();
   res.send(result);
 });
 
 app.get("/all-events", async (req, res) => {
-  const result = await eventsCollection.find({}).toArray();
-  res.send(result);
+  try {
+
+    const today = getTodayString();
+    const limit = Number.parseInt(req.query.limit, 10);
+
+    // Exclude past events and sort upcoming events by event date ascending.
+    let cursor = eventsCollection
+      .find({ date: { $gte: today } })
+      .sort({ date: 1 });
+
+    // Use MongoDB .limit() when requested (e.g. ?limit=6 for Recent Upcoming Events).
+    if (Number.isInteger(limit) && limit > 0) {
+      cursor = cursor.limit(limit);
+    }
+
+    const result = await cursor.toArray();
+    res.send(result);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: "Failed to load events" });
+  }
 });
 
-app.post("/joined", verifyAuth, async (req, res) => {
+app.post("/joined", verifyJwt, async (req, res) => {
   try {
-    // Only eventId is taken from the client; everything else is server-derived.
+    // Only eventId is taken from the client; the participant userId comes from
+    // the verified JWT (req.user.id). userId in req.body is never trusted.
     const eventId = String(req.body?.eventId || "");
 
     if (!ObjectId.isValid(eventId)) {
@@ -217,14 +314,14 @@ app.post("/joined", verifyAuth, async (req, res) => {
     // Fast path (also covers legacy email-only records not in the unique index).
     const alreadyJoined = await joiningCollection.findOne({
       eventId,
-      ...ownerFilter(req.user),
+      userId: req.user.id,
     });
     if (alreadyJoined) {
       return res.status(409).json({ message: "You have already joined this event" });
     }
 
     // Event details are copied from the verified original event document;
-    // participant identity comes from the verified session.
+    // participant identity comes from the verified JWT.
     const result = await joiningCollection.insertOne({
       bookingDate: new Date().toISOString(),
       eventId,
@@ -252,7 +349,7 @@ app.post("/joined", verifyAuth, async (req, res) => {
 
 
 // Leave a joined event
-app.delete("/delete-events/:id", verifyAuth, async (req, res) => {
+app.delete("/delete-events/:id", verifyJwt, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -262,16 +359,20 @@ app.delete("/delete-events/:id", verifyAuth, async (req, res) => {
       });
     }
 
-    const result = await joiningCollection.deleteOne({
-      _id: new ObjectId(id),
-      ...ownerFilter(req.user),
-    });
-
-    if (result.deletedCount === 0) {
+    // Find the participation record and verify it belongs to the authenticated user.
+    const record = await joiningCollection.findOne({ _id: new ObjectId(id) });
+    if (!record) {
       return res.status(404).json({
         message: "Joined event not found",
       });
     }
+    if (record.userId !== req.user.id) {
+      return res.status(403).json({
+        message: "Access denied: you can only leave your own participation",
+      });
+    }
+
+    const result = await joiningCollection.deleteOne({ _id: new ObjectId(id) });
 
     res.json({
       success: true,
@@ -286,7 +387,7 @@ app.delete("/delete-events/:id", verifyAuth, async (req, res) => {
 });
 
 // Update my created event
-app.patch("/update-events/:id", verifyAuth, async (req, res) => {
+app.patch("/update-events/:id", verifyJwt, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -303,19 +404,25 @@ app.patch("/update-events/:id", verifyAuth, async (req, res) => {
       });
     }
 
-    const result = await eventsCollection.updateOne(
-      {
-        _id: new ObjectId(id),
-        ...ownerFilter(req.user),
-      },
-      { $set: updates }
-    );
-
-    if (result.matchedCount === 0) {
+    // Fetch the actual event and compare its owner with the verified user ID.
+    const event = await eventsCollection.findOne({ _id: new ObjectId(id) });
+    if (!event) {
       return res.status(404).json({
-        message: "Event not found or access denied",
+        message: "Event not found",
       });
     }
+    if (event.userId !== req.user.id) {
+      return res.status(403).json({
+        message: "Access denied: you are not the owner of this event",
+      });
+    }
+
+    // Only validated event fields are updated; userId is not an updatable field,
+    // so event ownership can never be changed here.
+    const result = await eventsCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: updates }
+    );
 
     res.json({
       success: true,
@@ -329,7 +436,7 @@ app.patch("/update-events/:id", verifyAuth, async (req, res) => {
   }
 });
 
-app.delete("/created-events/:id", verifyAuth, async (req, res) => {
+app.delete("/created-events/:id", verifyJwt, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -339,16 +446,20 @@ app.delete("/created-events/:id", verifyAuth, async (req, res) => {
       });
     }
 
-    const result = await eventsCollection.deleteOne({
-      _id: new ObjectId(id),
-      ...ownerFilter(req.user),
-    });
-
-    if (result.deletedCount === 0) {
+    // Fetch the actual event and verify the authenticated user is its owner.
+    const event = await eventsCollection.findOne({ _id: new ObjectId(id) });
+    if (!event) {
       return res.status(404).json({
-        message: "Event not found or access denied",
+        message: "Event not found",
       });
     }
+    if (event.userId !== req.user.id) {
+      return res.status(403).json({
+        message: "Access denied: you are not the owner of this event",
+      });
+    }
+
+    const result = await eventsCollection.deleteOne({ _id: new ObjectId(id) });
 
     res.json({
       success: true,
@@ -364,6 +475,9 @@ app.delete("/created-events/:id", verifyAuth, async (req, res) => {
 
 
 app.get("/all-events/:id", async (req, res) => {
+  const authorization = req.headers.authorization;
+
+  console.log("Token received:", Boolean(authorization));
   const { id } = req.params;
   if (!ObjectId.isValid(id)) {
     return res.status(400).json({ message: "Invalid event ID" });
